@@ -1,11 +1,13 @@
 # UDP-Smasher  
 **Elite High-Performance UDP Network Stress Testing Tool**
-
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/mufaizz/UDP-Smasher/blob/main/LICENSE)
 ---
 
 ## 📌 Overview
 **UDP-Smasher** is a high-performance UDP packet generator designed for **authorized network stress testing**, **protocol validation**, and **research environments**.  
 Written in **Go** using **raw sockets**, it achieves extremely high packet throughput by minimizing kernel overhead and leveraging efficient memory handling techniques.
+
+License: MIT — see the [LICENSE](./LICENSE) file for full terms.
 
 > ⚠️ This tool is strictly for **legal and authorized use only**.
 
@@ -195,8 +197,15 @@ Context Switches: Minimal (LockOSThread)
 
 5.Open a Pull Request
 
-## 📄 License
-[MIT License](LICENSE)
+## License
+
+This repository is licensed under the MIT License — see the [LICENSE](./LICENSE) file for details.
+
+##Contact
+
+E-mail: mufaizmalik9622@gmail.com
+
+Instagram: https://www.instagram.com/muf4iz
 
 ## 🙏 Acknowledgments
 
