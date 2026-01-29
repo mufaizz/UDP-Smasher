@@ -1,0 +1,16 @@
+# Binaries
+attack
+*.exe
+*.out
+
+# Logs
+*.log
+go.mod
+go.sum
+# OS files
+.DS_Store
+Thumbs.db
+# IDE
+.vscode/
+*.swp
+*.swo
