@@ -89,4 +89,4 @@ Unauthorized usage may be illegal.
 ---
 
 ## 📄 License
-MIT License
+[MIT License](LICENSE)
